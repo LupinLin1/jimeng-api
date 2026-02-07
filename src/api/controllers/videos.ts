@@ -216,6 +216,139 @@ function buildMetaListFromPrompt(prompt: string): any {
   return { meta_list: metaList };
 }
 
+/**
+ * 获取原始质量的视频URL
+ * @param itemId 视频项ID
+ * @param refreshToken 刷新令牌
+ * @returns 原始视频URL，失败返回null
+ */
+async function fetchOriginVideoUrl(
+  itemId: string,
+  refreshToken: string
+): Promise<string | null> {
+  const startTime = Date.now();
+
+  try {
+    logger.info(`尝试获取原始视频URL, itemId: ${itemId}`);
+
+    const result = await request("post", "/mweb/v1/get_local_item_list", refreshToken, {
+      data: {
+        item_id_list: [itemId],
+        is_for_video_download: true,
+        pack_item_opt: {
+          scene: 1,
+          need_data_integrity: true
+        }
+      }
+    });
+
+    const elapsed = Date.now() - startTime;
+
+    // 验证响应结构
+    if (!result || typeof result !== 'object') {
+      logger.warn(`get_local_item_list返回无效响应`, {
+        itemId,
+        responseType: typeof result,
+        elapsedMs: elapsed
+      });
+      return null;
+    }
+
+    if (!Array.isArray(result.item_list)) {
+      logger.warn(`get_local_item_list响应缺少item_list字段`, {
+        itemId,
+        responseKeys: Object.keys(result),
+        elapsedMs: elapsed
+      });
+      return null;
+    }
+
+    if (result.item_list.length === 0) {
+      logger.warn(`get_local_item_list返回空item_list`, {
+        itemId,
+        elapsedMs: elapsed
+      });
+      return null;
+    }
+
+    // 从响应中提取 transcoded_video.origin.video_url
+    const firstItem = result.item_list[0];
+    if (firstItem?.video?.transcoded_video?.origin?.video_url) {
+      const originUrl = firstItem.video.transcoded_video.origin.video_url;
+
+      // 验证URL格式
+      try {
+        new URL(originUrl);
+      } catch (urlError) {
+        logger.error(`获取的origin URL格式无效`, {
+          itemId,
+          url: originUrl.substring(0, 100),
+          urlError: urlError.message,
+          elapsedMs: elapsed
+        });
+        return null;
+      }
+
+      logger.info(`成功获取原始视频URL`, {
+        itemId,
+        urlPrefix: originUrl.substring(0, 50) + '...',
+        elapsedMs: elapsed
+      });
+      return originUrl;
+    }
+
+    // 记录响应结构用于调试
+    logger.warn(`未能从get_local_item_list响应中提取origin URL`, {
+      itemId,
+      hasVideo: !!firstItem?.video,
+      hasTranscodedVideo: !!firstItem?.video?.transcoded_video,
+      hasOrigin: !!firstItem?.video?.transcoded_video?.origin,
+      originKeys: firstItem?.video?.transcoded_video?.origin
+        ? Object.keys(firstItem.video.transcoded_video.origin)
+        : [],
+      elapsedMs: elapsed
+    });
+    return null;
+  } catch (error) {
+    const elapsed = Date.now() - startTime;
+    const errorContext = {
+      itemId,
+      errorType: error.constructor.name,
+      errorMessage: error.message,
+      errorCode: error.code,
+      responseStatus: error.response?.status,
+      elapsedMs: elapsed
+    };
+
+    // 可预期的网络错误 - 使用降级策略
+    if (error.code === 'ECONNABORTED' ||
+        error.code === 'ETIMEDOUT' ||
+        error.message?.includes('timeout')) {
+      logger.warn(`获取原始视频URL超时，使用降级URL`, errorContext);
+      return null;
+    }
+
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      logger.warn(`获取原始视频URL认证失败，使用降级URL`, errorContext);
+      return null;
+    }
+
+    if (error.response?.status >= 500) {
+      logger.warn(`获取原始视频URL服务端错误 ${error.response.status}，使用降级URL`, errorContext);
+      return null;
+    }
+
+    // 不可预期的错误 - 记录详细信息但不中断流程
+    logger.error(`获取原始视频URL遇到未预期错误`, {
+      ...errorContext,
+      errorStack: error.stack
+    });
+
+    // 由于这是可选增强功能，仍然使用降级策略
+    // 但详细记录错误以便后续调试
+    return null;
+  }
+}
 
 /**
  * 生成视频
@@ -648,33 +781,6 @@ export async function generateVideo(
       },
     });
 
-    // 尝试直接从响应中提取视频URL
-    const responseStr = JSON.stringify(result);
-    const videoUrlMatch = responseStr.match(/https:\/\/v[0-9]+-artist\.vlabvod\.com\/[^"\s]+/);
-    if (videoUrlMatch && videoUrlMatch[0]) {
-      logger.info(`从API响应中直接提取到视频URL: ${videoUrlMatch[0]}`);
-      // 构造成功状态并返回
-      return {
-        status: {
-          status: 10,
-          itemCount: 1,
-          historyId
-        } as PollingStatus,
-        data: {
-          status: 10,
-          item_list: [{
-            video: {
-              transcoded_video: {
-                origin: {
-                  video_url: videoUrlMatch[0]
-                }
-              }
-            }
-          }]
-        }
-      };
-    }
-
     // 检查响应中是否有该 history_id 的数据
     // 由于 API 存在最终一致性，早期轮询可能暂时获取不到记录，返回处理中状态继续轮询
     if (!result[historyId]) {
@@ -721,8 +827,40 @@ export async function generateVideo(
 
   const item_list = finalHistoryData.item_list || [];
 
-  // 提取视频URL
+  // 首先尝试提取视频URL（作为降级方案）
   let videoUrl = item_list?.[0] ? extractVideoUrl(item_list[0]) : null;
+
+  // 尝试获取原始质量的视频URL
+  if (item_list?.[0]) {
+    const firstItem = item_list[0];
+
+    // 尝试从item中找到item_id
+    const itemId = firstItem.id ||
+                   firstItem.item_id ||
+                   firstItem.video?.id ||
+                   firstItem.video?.item_id ||
+                   firstItem.video?.video_id ||
+                   firstItem.common_attr?.id;
+
+    // 如果item中找不到itemId，尝试使用historyId
+    const finalItemId = itemId || historyId;
+
+    if (finalItemId) {
+      logger.info(`✓ 检测到itemId: ${finalItemId} ${itemId ? '(从item)' : '(使用historyId)'}, 尝试获取原始质量视频URL`);
+
+      // 调用新API获取原始URL
+      const originUrl = await fetchOriginVideoUrl(finalItemId, refreshToken);
+
+      if (originUrl) {
+        videoUrl = originUrl;
+        logger.info(`✓ 成功获取原始质量视频URL`);
+      } else {
+        logger.warn(`✗ 无法获取原始URL,使用当前URL`);
+      }
+    } else {
+      logger.warn(`✗ 无法确定itemId`);
+    }
+  }
 
   // 如果无法获取视频URL，抛出异常
   if (!videoUrl) {
