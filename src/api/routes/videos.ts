@@ -5,6 +5,7 @@ import Response from '@/lib/response/Response.ts';
 import { tokenSplit } from '@/api/controllers/core.ts';
 import { generateVideo, DEFAULT_MODEL } from '@/api/controllers/videos.ts';
 import util from '@/lib/util.ts';
+import logger from '@/lib/logger.ts';
 
 export default {
 
@@ -23,26 +24,31 @@ export default {
                 .validate('body.resolution', v => _.isUndefined(v) || _.isString(v))
                 .validate('body.duration', v => {
                     if (_.isUndefined(v)) return true;
-                    // 支持的时长: 4/8/12 (sora2) 和 5/10 (其他模型)
-                    const validDurations = [4, 5, 8, 10, 12];
+                    // 支持的时长: 4-15秒 (seedance-2.0), 4/8/12 (sora2), 5/10/12 (3.5-pro), 5/10 (其他模型)
+                    // 统一支持 4-15 秒范围，各模型会根据自身能力验证
+                    const minDuration = 4;
+                    const maxDuration = 15;
                     // 对于 multipart/form-data，允许字符串类型的数字
                     if (isMultiPart && typeof v === 'string') {
                         const num = parseInt(v);
-                        return validDurations.includes(num);
+                        return num >= minDuration && num <= maxDuration;
                     }
                     // 对于 JSON，要求数字类型
-                    return _.isFinite(v) && validDurations.includes(v);
+                    return _.isFinite(v) && v >= minDuration && v <= maxDuration;
                 })
-                // 限制图片URL数量最多2个
-                .validate('body.file_paths', v => _.isUndefined(v) || (_.isArray(v) && v.length <= 2))
-                .validate('body.filePaths', v => _.isUndefined(v) || (_.isArray(v) && v.length <= 2))
+                // file_paths: 支持 1-5 个素材（统一接口）
+                // 可以是字符串数组 ["url1", "url2"] 或对象数组 [{type:"image",url:"url1"}, ...]
+                .validate('body.file_paths', v => _.isUndefined(v) || (_.isArray(v) && v.length <= 5))
+                .validate('body.filePaths', v => _.isUndefined(v) || (_.isArray(v) && v.length <= 5))
+                // 新增：全能参考模式参数验证
+                .validate('body.mode', v => _.isUndefined(v) || ['auto', 'first_last_frames', 'omni_reference'].includes(v))
                 .validate('body.response_format', v => _.isUndefined(v) || _.isString(v))
                 .validate('headers.authorization', _.isString);
 
-            // 限制上传文件数量最多2个
+            // 限制上传文件数量最多5个（与 file_paths 一致）
             const uploadedFiles = request.files ? _.values(request.files) : [];
-            if (uploadedFiles.length > 2) {
-                throw new Error('最多只能上传2个图片文件');
+            if (uploadedFiles.length > 5) {
+                throw new Error('最多只能上传5个素材文件');
             }
 
             // refresh_token切分
@@ -58,6 +64,7 @@ export default {
                 duration = 5,
                 file_paths = [],
                 filePaths = [],
+                mode = "auto",
                 response_format = "url"
             } = request.body;
 
@@ -66,8 +73,36 @@ export default {
                 ? parseInt(duration)
                 : duration;
 
-            // 兼容两种参数名格式：file_paths 和 filePaths
-            const finalFilePaths = filePaths.length > 0 ? filePaths : file_paths;
+            // ========== 智能参数合并 ==========
+            // 统一使用 file_paths 参数，支持多种输入格式
+            const rawFilePaths = filePaths.length > 0 ? filePaths : file_paths;
+
+            // 检测输入格式并转换为统一的 materials 格式
+            let finalMaterials = [];
+            if (rawFilePaths && rawFilePaths.length > 0) {
+                // 判断输入格式：字符串数组 或 对象数组
+                if (typeof rawFilePaths[0] === 'string') {
+                    // 字符串数组格式：["url1", "url2"] → [{type:"image",url:"url1"}, ...]
+                    finalMaterials = rawFilePaths.map((url: string) => ({
+                        type: "image",
+                        url: url
+                    }));
+                    logger.info(`检测到字符串格式的 file_paths，已自动转换为 materials 格式（${finalMaterials.length} 个素材）`);
+                } else {
+                    // 对象数组格式：已经是标准格式
+                    finalMaterials = rawFilePaths;
+                    logger.info(`检测到对象格式的 file_paths（${finalMaterials.length} 个素材）`);
+                }
+            }
+
+            // ========== 日志记录 ==========
+            if (finalMaterials.length > 0) {
+                logger.info(`最终使用的 file_paths 数量: ${finalMaterials.length}`);
+                // 统计素材类型
+                const imageCount = finalMaterials.filter((m: any) => m.type === 'image').length;
+                const videoCount = finalMaterials.filter((m: any) => m.type === 'video').length;
+                logger.info(`素材类型统计: 图片${imageCount}个, 视频${videoCount}个`);
+            }
 
             // 生成视频
             const videoUrl = await generateVideo(
@@ -77,8 +112,9 @@ export default {
                     ratio,
                     resolution,
                     duration: finalDuration,
-                    filePaths: finalFilePaths,
-                    files: request.files, // 传递上传的文件
+                    files: request.files, // 本地上传文件
+                    mode,
+                    materials: finalMaterials, // 统一使用 materials
                 },
                 token
             );
